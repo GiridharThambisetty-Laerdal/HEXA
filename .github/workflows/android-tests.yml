@@ -112,7 +112,7 @@ jobs:
           New-Item -ItemType Directory -Force "$HOME\.android" | Out-Null
           Set-Content -Path "$HOME\.android\adbkey"     -Value $env:ADB_KEY
           Set-Content -Path "$HOME\.android\adbkey.pub" -Value $env:ADB_KEY_PUB
-
+      
       # ---------- Connect to phone ----------
       - name: Wake tunnel and connect adb
         run: |
@@ -129,7 +129,47 @@ jobs:
           if (-not $ok) { throw "Could not connect to $env:ANDROID_SERIAL" }
           adb devices
           adb shell getprop ro.product.model
+      - name: Install PowerShell profile (so Robot's PowerShell sessions have the functions)
+        run: |
+          $targets = @(
+            "$HOME\Documents\PowerShell\profile.ps1",          # pwsh 7
+            "$HOME\Documents\WindowsPowerShell\profile.ps1"    # Windows PowerShell 5.1
+          )
+          foreach ($t in $targets) {
+            New-Item -ItemType Directory -Force (Split-Path $t) | Out-Null
+            Copy-Item ci/profile.ps1 $t -Force
+          }
 
+          # profiles only load if scripts are allowed to run
+          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
+          powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force"
+
+          # prove both shells load it in a fresh session
+          Write-Host "--- pwsh 7 ---"
+          pwsh -Command "Get-Command clearapp, giveaccess, enable-bt, start_appium | Format-Table Name"
+          Write-Host "--- Windows PowerShell 5.1 ---"
+          powershell -Command "Get-Command clearapp, giveaccess, enable-bt, start_appium | Format-Table Name"
+          
+      - name: Pre-install Appium helper apps on phone
+        run: |
+          $root = "$HOME\.appium\node_modules"
+          $found = @(
+            Get-ChildItem $root -Recurse -Filter "appium-uiautomator2-server-v*.apk" | Select-Object -First 1
+            Get-ChildItem $root -Recurse -Filter "appium-uiautomator2-server-debug-androidTest.apk" | Select-Object -First 1
+          ) + @(
+            Get-ChildItem "$env:APPDATA\npm" -Recurse -Filter "settings_apk-debug.apk" -ErrorAction SilentlyContinue | Select-Object -First 1
+            Get-ChildItem $root -Recurse -Filter "settings_apk-debug.apk" -ErrorAction SilentlyContinue | Select-Object -First 1
+          )
+          $found = $found | Where-Object { $_ } | Sort-Object FullName -Unique
+          if (-not $found) {
+            Get-ChildItem $root -Recurse -Filter "*.apk" | Select-Object -First 20 FullName
+            throw "No Appium helper APKs found"
+          }
+          foreach ($apk in $found) {
+            Write-Host "Installing $($apk.FullName)"
+            adb install -r -g $apk.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Install failed: $($apk.Name)" }
+          }
       # ---------- Prepare phone, Appium, tests ----------
       - name: Prepare phone, start Appium, run Robot
         run: |
