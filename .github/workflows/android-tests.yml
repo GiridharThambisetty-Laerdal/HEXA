@@ -20,7 +20,6 @@ jobs:
     env:
       ANDROID_SERIAL: ${{ github.event.inputs.device_ip || '100.77.20.126:5555' }}
       ROBOT_TAG: ${{ github.event.inputs.tag || 'Homepage' }}
-      APPIUM_VERSION: "4.0.0-beta.7"
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +32,7 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      # ---------- Java / Node / Python (latest) ----------
+      # ---------- Java / Node / Python ----------
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -47,9 +46,8 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.x"      # if pip install fails on 3.15, use "3.14"
           check-latest: true
-          cache: pip            # requires requirements.txt in the repo root
 
       - name: Show toolchain versions
         run: |
@@ -58,45 +56,51 @@ jobs:
           npm --version
           python --version
 
-      # ---------- ADB ----------
-      - name: Ensure adb is installed
+      # ---------- Android SDK (same packages as your laptop) ----------
+      - name: Install Android SDK packages
         run: |
-          $adb = Get-Command adb -ErrorAction SilentlyContinue
-          if ($adb) {
-            Write-Host "adb already on PATH: $($adb.Source)"
-          }
-          elseif ($env:ANDROID_HOME -and (Test-Path "$env:ANDROID_HOME\platform-tools\adb.exe")) {
-            Write-Host "Using preinstalled platform-tools in $env:ANDROID_HOME"
-            "$env:ANDROID_HOME\platform-tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          }
-          else {
-            Write-Host "Downloading latest platform-tools"
-            $sdk = "$env:RUNNER_TEMP\sdk"
-            New-Item -ItemType Directory -Force $sdk | Out-Null
-            Invoke-WebRequest "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "$env:RUNNER_TEMP\pt.zip"
-            Expand-Archive "$env:RUNNER_TEMP\pt.zip" -DestinationPath $sdk -Force
-            "$sdk\platform-tools"   | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-            "ANDROID_HOME=$sdk"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            "ANDROID_SDK_ROOT=$sdk" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          }
+          $sdk = $env:ANDROID_HOME
+          if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+          if (-not $sdk -or -not (Test-Path $sdk)) { throw "No Android SDK found on the runner (ANDROID_HOME='$sdk')" }
+
+          $sm = Join-Path $sdk "cmdline-tools\latest\bin\sdkmanager.bat"
+          if (-not (Test-Path $sm)) { throw "sdkmanager not found at $sm" }
+
+          1..30 | ForEach-Object { "y" } | & $sm --sdk_root=$sdk --licenses | Out-Null
+
+          & $sm --sdk_root=$sdk `
+            "platform-tools" `
+            "build-tools;36.0.0" `
+            "build-tools;37.0.0" `
+            "platforms;android-36" `
+            "platforms;android-37.0"
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager failed" }
+
+          "ANDROID_HOME=$sdk"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "ANDROID_SDK_ROOT=$sdk" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$sdk\platform-tools"   | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+          & $sm --sdk_root=$sdk --list_installed
 
       - name: Verify adb
         run: |
           adb version
           Write-Host "ANDROID_HOME = $env:ANDROID_HOME"
+          Get-ChildItem "$env:ANDROID_HOME\build-tools"
 
-      # ---------- Appium 4 + Robot ----------
-      - name: Install Appium 4 and drivers
+      # ---------- Appium (latest) ----------
+      - name: Install Appium and drivers
         run: |
-          npm install -g "appium@$env:APPIUM_VERSION"
+          npm install -g appium@latest
           appium --version
           appium driver install uiautomator2
           appium driver list --installed
 
-      - name: Install Robot libraries (latest)
+      # ---------- Robot libraries ----------
+      - name: Install Robot libraries
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade -r requirements.txt
+          pip install --upgrade robotframework robotframework-appiumlibrary robotframework-jsonlibrary Appium-Python-Client
           pip list | Select-String -Pattern "robotframework|appium|json"
 
       # ---------- adb trust ----------
