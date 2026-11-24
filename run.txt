@@ -1,0 +1,1 @@
+robot -i Homepage -d Reports --variable Device_name:5955ce90 --variable Appium_server:http://localhost:4723 .
