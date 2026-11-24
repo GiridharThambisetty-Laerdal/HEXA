@@ -1,0 +1,160 @@
+name: Android Remote Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_ip:
+        description: "Phone Tailscale IP:port"
+        default: "100.77.20.126:5555"
+      tag:
+        description: "Robot tag to run"
+        default: "Homepage"
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ANDROID_SERIAL: ${{ github.event.inputs.device_ip || '100.77.20.126:5555' }}
+      ROBOT_TAG: ${{ github.event.inputs.tag || 'Homepage' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Tailscale ----------
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      # ---------- Java / Node / Python ----------
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          check-latest: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          check-latest: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"      # if pip install fails on 3.15, use "3.14"
+          check-latest: true
+
+      - name: Show toolchain versions
+        run: |
+          java -version
+          node --version
+          npm --version
+          python --version
+
+      # ---------- Android SDK (same packages as your laptop) ----------
+      - name: Install Android SDK packages
+        run: |
+          $sdk = $env:ANDROID_HOME
+          if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+          if (-not $sdk -or -not (Test-Path $sdk)) { throw "No Android SDK found on the runner (ANDROID_HOME='$sdk')" }
+
+          $sm = Join-Path $sdk "cmdline-tools\latest\bin\sdkmanager.bat"
+          if (-not (Test-Path $sm)) { throw "sdkmanager not found at $sm" }
+
+          1..30 | ForEach-Object { "y" } | & $sm --sdk_root=$sdk --licenses | Out-Null
+
+          & $sm --sdk_root=$sdk `
+            "platform-tools" `
+            "build-tools;36.0.0" `
+            "build-tools;37.0.0" `
+            "platforms;android-36" `
+            "platforms;android-37.0"
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager failed" }
+
+          "ANDROID_HOME=$sdk"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "ANDROID_SDK_ROOT=$sdk" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$sdk\platform-tools"   | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+          & $sm --sdk_root=$sdk --list_installed
+
+      - name: Verify adb
+        run: |
+          adb version
+          Write-Host "ANDROID_HOME = $env:ANDROID_HOME"
+          Get-ChildItem "$env:ANDROID_HOME\build-tools"
+
+      # ---------- Appium (latest) ----------
+      - name: Install Appium and drivers
+        run: |
+          npm install -g appium@latest
+          appium --version
+          appium driver install uiautomator2
+          appium driver list --installed
+
+      # ---------- Robot libraries ----------
+      - name: Install Robot libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade robotframework robotframework-appiumlibrary robotframework-jsonlibrary Appium-Python-Client
+          pip list | Select-String -Pattern "robotframework|appium|json"
+
+      # ---------- adb trust ----------
+      - name: Install pre-authorized adb key
+        env:
+          ADB_KEY: ${{ secrets.ADB_KEY }}
+          ADB_KEY_PUB: ${{ secrets.ADB_KEY_PUB }}
+        run: |
+          New-Item -ItemType Directory -Force "$HOME\.android" | Out-Null
+          Set-Content -Path "$HOME\.android\adbkey"     -Value $env:ADB_KEY
+          Set-Content -Path "$HOME\.android\adbkey.pub" -Value $env:ADB_KEY_PUB
+
+      # ---------- Connect to phone ----------
+      - name: Wake tunnel and connect adb
+        run: |
+          $ip = $env:ANDROID_SERIAL.Split(':')[0]
+          adb start-server
+          $ok = $false
+          for ($i = 1; $i -le 6 -and -not $ok; $i++) {
+            Write-Host "Attempt $i"
+            try { tailscale ping --c=5 --timeout=5s $ip } catch { Write-Host "tailscale ping failed (ignored)" }
+            $out = adb connect $env:ANDROID_SERIAL
+            Write-Host $out
+            if ("$out" -match 'connected to') { $ok = $true } else { Start-Sleep 5 }
+          }
+          if (-not $ok) { throw "Could not connect to $env:ANDROID_SERIAL" }
+          adb devices
+          adb shell getprop ro.product.model
+
+      # ---------- Prepare phone, Appium, tests ----------
+      - name: Prepare phone, start Appium, run Robot
+        run: |
+          . ./ci/profile.ps1
+          adb shell settings put system accelerometer_rotation 0
+          adb shell settings put system user_rotation 0
+          adb shell input keyevent KEYCODE_WAKEUP
+          giveaccess
+          start_appium
+          robot -i $env:ROBOT_TAG -d Reports `
+            --variable "Device_name:$env:ANDROID_SERIAL" `
+            --variable "Appium_server:http://localhost:4723" .
+          exit $LASTEXITCODE
+
+      # ---------- Always collect results ----------
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-reports
+          path: |
+            Reports/
+            appium.log
+            appium.err.log
+
+      - name: Disconnect adb
+        if: always()
+        run: adb disconnect $env:ANDROID_SERIAL
